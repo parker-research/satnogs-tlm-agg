@@ -1,0 +1,17 @@
+# Secrets
+.env
+
+# Working data and outputs
+data/
+out/
+
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.venv
+.pytest_cache/
+.ruff_cache/

@@ -1,0 +1,40 @@
+[project]
+name = "satnogs-tlm-agg"
+version = "0.1.0"
+description = "Tools to fetch and aggregate telemetry across hundreds of satellite missions on SatNOGS, summarizing temperature during orbital decay"
+readme = "README.md"
+authors = [
+    { name = "parker-research", email = "166864283+parker-research@users.noreply.github.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "duckdb>=2.0.0",
+    "loguru>=0.7.3",
+    "polars>=2.1.0",
+    "pyarrow>=26.0.0",
+    "python-dotenv>=1.2.4",
+    "pytz>=2026.6",
+    "requests>=2.34.2",
+    "satnogs-decoders>=1.132.0",
+    "tyro>=1.0.16",
+]
+
+[project.scripts]
+satnogs-tlm-agg = "satnogs_tlm_agg:main"
+
+[build-system]
+requires = ["uv_build>=0.13.6,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "ruff>=0.17.3",
+]
+
+[tool.ruff]
+line-length = 110
+
+[tool.ruff.lint]
+select = ["F", "E", "B", "I", "UP"]
+ignore = ["E501"]
