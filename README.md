@@ -21,6 +21,11 @@ cp .env.sample .env   # then fill in your keys
 - `SATNOGS_NETWORK_API_KEY`: optional. Anonymous Network access works but is heavily rate limited.
 - `HF_TOKEN`: optional. Gives higher Hugging Face rate limits when loading historical TLEs.
 
+**Polars runtime:** the dependency includes the Polars build for older CPUs (`rtcompat`), so it
+runs on machines without AVX2 etc., and Polars uses it automatically. On a modern machine
+you can switch to the faster default build with `POLARS_FORCE_PKG=32`. Fetching is bound by
+API rate limits, so the difference is small here.
+
 ## Usage
 
 ```sh
