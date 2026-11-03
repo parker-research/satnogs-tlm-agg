@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Literal
 
 import duckdb
 import polars as pl
 from loguru import logger
 
-from .archive import RawArchive
 from .config import NETWORK_API_BASE
 from .http import ApiError, SatnogsClient
 from .satnogs_db import FRAME_SCHEMA, _int, frame_id, insert_frames
@@ -107,9 +106,9 @@ def insert_observations(con: duckdb.DuckDBPyConnection, df: pl.DataFrame) -> int
     return n_new
 
 
-def _network_window(lower: datetime | None, upper: datetime) -> dict[str, str]:
-    # Network filters: start = obs start >= x, start__lt = obs start < x (no gaps, no overlap)
-    params = {"start__lt": iso(upper)}
+def _network_window(lower: datetime | None, upper: datetime, inclusive: bool) -> dict[str, str]:
+    # Network filters: start = obs start >= x, start__lt = obs start < x
+    params = {"start__lt": iso(upper + timedelta(microseconds=1) if inclusive else upper)}
     if lower is not None:
         params["start"] = iso(lower)
     return params
@@ -122,18 +121,17 @@ def ingest_observations_page(con: duckdb.DuckDBPyConnection, records: list[dict[
 def fetch_observations(
     client: SatnogsClient,
     con: duckdb.DuckDBPyConnection,
-    archive: RawArchive,
     sat_id: str,
     label: str,
     *,
     max_pages: int,
     schedule: Schedule,
-    decayed: datetime | None = None,
+    launched: datetime | None,
+    decayed: datetime | None,
 ) -> WalkResult:
     return walk(
         client,
         con,
-        archive,
         kind="network_obs",
         sat_id=sat_id,
         label=label,
@@ -144,6 +142,7 @@ def fetch_observations(
         ingest=lambda records: ingest_observations_page(con, records),
         max_pages=max_pages,
         schedule=schedule,
+        launched=launched,
         decayed=decayed,
     )
 
@@ -196,14 +195,9 @@ def demod_frame_row(obs: tuple, url: str, content: bytes) -> dict[str, Any] | No
     }
 
 
-def record_demod_file(
-    con: duckdb.DuckDBPyConnection, url: str, obs_id: int, status: int, n_bytes: int, fid: str | None
-) -> None:
+def record_demod_file(con: duckdb.DuckDBPyConnection, url: str, obs_id: int, status: int) -> None:
     with WRITE_LOCK:
-        con.execute(
-            "INSERT OR IGNORE INTO demod_files VALUES (?, ?, ?, ?, ?, ?)",
-            [url, obs_id, status, n_bytes, fid, now()],
-        )
+        con.execute("INSERT OR IGNORE INTO demod_files VALUES (?, ?, ?, ?)", [url, obs_id, status, now()])
 
 
 def pending_demod_observations(
@@ -213,7 +207,7 @@ def pending_demod_observations(
 
     `gap-fill` (default): SatNOGS Network forwards demodulated frames to SatNOGS DB, so the
     files are mostly duplicates of DB telemetry. Only download them for observations inside a
-    time range the DB fetch has fully covered and for which the DB returned no frames.
+    day the DB fetch has fully covered and for which the DB returned no frames.
     """
     if mode == "off":
         return []
@@ -223,7 +217,10 @@ def pending_demod_observations(
         where.append("o.sat_id IN (SELECT unnest($sat_ids))")
         params["sat_ids"] = sat_ids
     if mode == "gap-fill":
-        where.append("p.covered_until IS NOT NULL AND o.start <= p.covered_until")
+        where.append(
+            """EXISTS (SELECT 1 FROM fetch_days fd WHERE fd.kind = 'db_telemetry'
+                       AND fd.sat_id = coalesce(prim.primary_id, o.sat_id) AND fd.day = o.start::DATE)"""
+        )
         where.append("NOT EXISTS (SELECT 1 FROM frames f WHERE f.source = 'db' AND f.observation_id = o.id)")
     return con.execute(
         f"""
@@ -233,8 +230,6 @@ def pending_demod_observations(
         SELECT {", ".join("o." + c.strip() for c in _OBS_META_COLS.split(","))}, o.demod_urls
         FROM network_observations o
         LEFT JOIN prim ON prim.child = o.sat_id
-        LEFT JOIN fetch_progress p
-            ON p.kind = 'db_telemetry' AND p.sat_id = coalesce(prim.primary_id, o.sat_id)
         WHERE {" AND ".join(where)}
         ORDER BY EXISTS (SELECT 1 FROM satellite_decoders d WHERE d.sat_id = o.sat_id) DESC, o.start DESC
         LIMIT $limit
@@ -246,7 +241,6 @@ def pending_demod_observations(
 def fetch_demod_frames(
     client: SatnogsClient,
     con: duckdb.DuckDBPyConnection,
-    archive: RawArchive,
     *,
     mode: DemodMode = "gap-fill",
     sat_ids: list[str] | None = None,
@@ -278,12 +272,10 @@ def fetch_demod_frames(
                     retry_later = True  # transient: try this file again later
                     continue
                 content, status = b"", exc.status
-            if status == 200:
-                archive.write("network_demod", {"obs_id": obs_id, "url": url, "content_hex": content.hex()})
             r = demod_frame_row(meta, url, content) if content else None
             if r is not None:
                 total += insert_frames(con, pl.DataFrame([r], schema=FRAME_SCHEMA))
-            record_demod_file(con, url, obs_id, status, len(content), r["frame_id"] if r else None)
+            record_demod_file(con, url, obs_id, status)
         if not retry_later:
             with WRITE_LOCK:
                 con.execute("UPDATE network_observations SET demod_fetched = TRUE WHERE id = ?", [obs_id])

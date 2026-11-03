@@ -1,4 +1,4 @@
-"""DuckDB working store for intermediate data (raw frames, progress state, decoded fields)."""
+"""DuckDB store: everything fetched, the incremental fetch progress, and decode results."""
 
 from __future__ import annotations
 
@@ -66,39 +66,35 @@ CREATE TABLE IF NOT EXISTS frames (
     fetched_at      TIMESTAMPTZ
 );
 
--- Per-satellite fetch state ('db_telemetry' | 'network_obs').
---
--- Each satellite's timeline is fetched as a sequence of time *windows*, walked newest-first
--- with the server's cursor. After every page the `next_url` cursor is saved, so an interrupted
--- walk continues exactly where it stopped: no page is ever requested twice.
---   covered_until : everything with timestamp <= this is stored (NULL = nothing complete yet)
---   window_end    : upper bound of the window being walked (query parameter)
---   window_ceiling: becomes `covered_until` when the window completes
---   next_url      : saved server cursor for the next page of the current window
--- When a window completes the satellite is rescheduled (`next_check_at`) with exponential
--- back-off while nothing new arrives; re-entered satellites become `final` (never re-queried).
-CREATE TABLE IF NOT EXISTS fetch_progress (
+-- Days whose records are completely stored, per satellite and source ('db_telemetry' =
+-- SatNOGS DB frames, 'network_obs' = SatNOGS Network observations). A day is recorded the
+-- moment the newest-first walk has passed below its start; `n_records` may be 0.
+CREATE TABLE IF NOT EXISTS fetch_days (
     kind            VARCHAR NOT NULL,
     sat_id          VARCHAR NOT NULL,
-    backfill_done   BOOLEAN DEFAULT FALSE,
-    oldest_ts       TIMESTAMPTZ,
-    newest_ts       TIMESTAMPTZ,
-    n_records       BIGINT DEFAULT 0,
-    last_run        TIMESTAMPTZ,
+    day             DATE NOT NULL,
+    n_records       BIGINT NOT NULL,
+    fetched_at      TIMESTAMPTZ,
+    PRIMARY KEY (kind, sat_id, day)
+);
+
+-- Per satellite and source: the walk in progress (if any). See walker.py for the fetch order
+-- (probe -> end of life -> random chunks). A walk covers the days [window_start, window_end),
+-- newest first; `next_url` (the server cursor) is saved after every page.
+CREATE TABLE IF NOT EXISTS fetch_state (
+    kind            VARCHAR NOT NULL,
+    sat_id          VARCHAR NOT NULL,
+    probed          BOOLEAN DEFAULT FALSE, -- the one-request whole-history probe is done
+    window_start    DATE,                  -- NULL while probing
+    window_end      DATE,                  -- exclusive; NULL = no walk in progress
+    next_url        VARCHAR,
+    oldest_fetched  TIMESTAMPTZ,           -- the walk has stored everything in (this, window_end)
+    n_requests      BIGINT DEFAULT 0,      -- total requests made for this satellite/source
+    not_before      TIMESTAMPTZ,           -- don't request before this (rate limits, errors)
     last_error      VARCHAR,
+    updated_at      TIMESTAMPTZ,
     PRIMARY KEY (kind, sat_id)
 );
-ALTER TABLE fetch_progress ADD COLUMN IF NOT EXISTS covered_until TIMESTAMPTZ;
-ALTER TABLE fetch_progress ADD COLUMN IF NOT EXISTS window_end TIMESTAMPTZ;
-ALTER TABLE fetch_progress ADD COLUMN IF NOT EXISTS window_ceiling TIMESTAMPTZ;
-ALTER TABLE fetch_progress ADD COLUMN IF NOT EXISTS window_oldest TIMESTAMPTZ;
-ALTER TABLE fetch_progress ADD COLUMN IF NOT EXISTS window_new BIGINT DEFAULT 0;
-ALTER TABLE fetch_progress ADD COLUMN IF NOT EXISTS next_url VARCHAR;
-ALTER TABLE fetch_progress ADD COLUMN IF NOT EXISTS next_check_at TIMESTAMPTZ;
-ALTER TABLE fetch_progress ADD COLUMN IF NOT EXISTS check_interval_h DOUBLE;
-ALTER TABLE fetch_progress ADD COLUMN IF NOT EXISTS final BOOLEAN DEFAULT FALSE;
-ALTER TABLE fetch_progress ADD COLUMN IF NOT EXISTS n_requests BIGINT DEFAULT 0;
-ALTER TABLE fetch_progress ADD COLUMN IF NOT EXISTS layout_version INTEGER DEFAULT 1;
 
 CREATE TABLE IF NOT EXISTS network_observations (
     id              BIGINT PRIMARY KEY,
@@ -123,13 +119,11 @@ CREATE TABLE IF NOT EXISTS network_observations (
     fetched_at      TIMESTAMPTZ
 );
 
--- Every demod file URL ever requested (so an interrupted observation never re-downloads).
+-- Every demod file URL already requested (so an interrupted observation never re-downloads).
 CREATE TABLE IF NOT EXISTS demod_files (
     url             VARCHAR PRIMARY KEY,
     observation_id  BIGINT,
     http_status     INTEGER,
-    n_bytes         INTEGER,
-    frame_id        VARCHAR,
     fetched_at      TIMESTAMPTZ
 );
 
@@ -153,7 +147,29 @@ CREATE TABLE IF NOT EXISTS decode_attempts (
     PRIMARY KEY (frame_id, decoder)
 );
 
-ALTER TABLE satellites ADD COLUMN IF NOT EXISTS is_frequency_violator BOOLEAN;
+-- Historical TLE mean elements (Hugging Face juliensimon/space-track-tle-history), for SGP4.
+CREATE TABLE IF NOT EXISTS tles (
+    norad_cat_id    INTEGER NOT NULL,
+    epoch           TIMESTAMPTZ NOT NULL,
+    inclination     FLOAT,
+    raan            FLOAT,
+    eccentricity    FLOAT,
+    arg_perigee     FLOAT,
+    mean_anomaly    FLOAT,
+    mean_motion     DOUBLE,
+    mean_motion_dot DOUBLE,
+    bstar           DOUBLE,
+    PRIMARY KEY (norad_cat_id, epoch)
+);
+
+-- Which satellites have been loaded from which version of each yearly TLE file.
+CREATE TABLE IF NOT EXISTS tle_files (
+    file            VARCHAR NOT NULL,
+    version         VARCHAR NOT NULL,
+    norad_cat_id    INTEGER NOT NULL,
+    loaded_at       TIMESTAMPTZ,
+    PRIMARY KEY (file, norad_cat_id)
+);
 
 -- Telemetry of merged ("associated") satellites is served and attributed under the primary
 -- satellite, so a primary inherits its children's decoders.
@@ -169,15 +185,48 @@ CREATE OR REPLACE VIEW satellite_decoders AS
 -- Satellites whose telemetry is served via another (primary) satellite.
 CREATE OR REPLACE VIEW merged_satellites AS
     SELECT DISTINCT unnest(associated_satellites) AS sat_id FROM satellites;
-"""
 
-# Convert progress rows written by the first (overlap-based) fetch layout.
-MIGRATIONS = """
-UPDATE fetch_progress SET covered_until = newest_ts, layout_version = 2
-    WHERE layout_version = 1 AND backfill_done;
-UPDATE fetch_progress SET window_end = oldest_ts, window_ceiling = newest_ts, layout_version = 2
-    WHERE layout_version = 1 AND NOT backfill_done AND oldest_ts IS NOT NULL;
-UPDATE fetch_progress SET layout_version = 2 WHERE layout_version = 1;
+-- Per satellite and source: fetched vs. remaining days. Expected days run from launch (not
+-- before 2013, pre-SatNOGS) to yesterday, or to 14 days after decay. Must match
+-- walker.expected_range.
+CREATE OR REPLACE VIEW fetch_coverage AS
+    SELECT k.kind, s.sat_id, s.name, s.norad_cat_id, s.status, s.launched, s.decayed,
+           greatest(coalesce(s.launched::DATE, DATE '2013-01-01'), DATE '2013-01-01') AS expected_from,
+           least(current_date, coalesce(s.decayed::DATE + 15, current_date)) AS expected_to,
+           d.first_day, d.last_day,
+           coalesce(d.days_fetched, 0) AS days_fetched,
+           greatest(date_diff('day', expected_from, expected_to) - coalesce(d.days_fetched_expected, 0), 0)
+               AS days_remaining,
+           coalesce(d.n_records, 0) AS n_records,
+           coalesce(st.n_requests, 0) AS n_requests,
+           coalesce(st.probed, FALSE) AS probed,
+           st.window_end IS NOT NULL AS walking,
+           st.oldest_fetched AS walking_at,
+           st.not_before,
+           st.last_error
+    FROM satellites s
+    CROSS JOIN (VALUES ('db_telemetry'), ('network_obs')) k(kind)
+    LEFT JOIN (
+        SELECT f.kind, f.sat_id, min(day) AS first_day, max(day) AS last_day,
+               count(*) AS days_fetched, sum(n_records) AS n_records,
+               count(*) FILTER (WHERE day >= DATE '2013-01-01'
+                                  AND day >= coalesce(sat.launched::DATE, DATE '2013-01-01')
+                                  AND day < coalesce(sat.decayed::DATE + 15, current_date))
+                   AS days_fetched_expected
+        FROM fetch_days f JOIN satellites sat USING (sat_id) GROUP BY f.kind, f.sat_id
+    ) d ON d.kind = k.kind AND d.sat_id = s.sat_id
+    LEFT JOIN fetch_state st ON st.kind = k.kind AND st.sat_id = s.sat_id;
+
+-- Every expected day not yet fetched (filter by sat_id/kind when querying).
+CREATE OR REPLACE VIEW fetch_days_remaining AS
+    SELECT e.kind, e.sat_id, e.name, e.day
+    FROM (
+        SELECT kind, sat_id, name,
+               unnest(generate_series(expected_from::TIMESTAMP, (expected_to - 1)::TIMESTAMP,
+                                      INTERVAL 1 DAY))::DATE AS day
+        FROM fetch_coverage
+    ) e
+    ANTI JOIN fetch_days f ON f.kind = e.kind AND f.sat_id = e.sat_id AND f.day = e.day;
 """
 
 # DuckDB allows concurrent cursors, but we serialise writes from the fetcher threads so
@@ -191,7 +240,6 @@ def connect(path: Path, read_only: bool = False) -> duckdb.DuckDBPyConnection:
     con.execute("SET GLOBAL TimeZone = 'UTC'")
     if not read_only:
         con.execute(SCHEMA)
-        con.execute(MIGRATIONS)
     return con
 
 

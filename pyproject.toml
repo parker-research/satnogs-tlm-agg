@@ -15,6 +15,7 @@ dependencies = [
     "python-dotenv>=1.2.4",
     "pytz>=2026.6",
     "requests>=2.34.2",
+    "satkit>=0.24.1",
     "satnogs-decoders>=1.132.0",
     "tyro>=1.0.16",
 ]

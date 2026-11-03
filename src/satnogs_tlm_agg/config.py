@@ -26,11 +26,7 @@ class Settings:
 
     @property
     def duckdb_path(self) -> Path:
-        return self.data_dir / "satnogs.duckdb"
-
-    @property
-    def raw_dir(self) -> Path:
-        return self.data_dir / "raw"
+        return self.data_dir / "satnogs_tlm_agg.duckdb"
 
 
 def load_settings(env_file: Path, data_dir: Path, out_dir: Path) -> Settings:
@@ -52,3 +48,21 @@ def load_settings(env_file: Path, data_dir: Path, out_dir: Path) -> Settings:
         data_dir=data_dir,
         out_dir=out_dir,
     )
+
+
+# NORAD IDs never fetched or exported: crewed space stations (and station modules), which are
+# not representative "normal" satellites. Extend as needed.
+BLACKLIST_NORAD_IDS: frozenset[int] = frozenset(
+    {
+        25544,  # ISS (ZARYA)
+        49044,  # ISS (NAUKA)
+        48274,  # CSS (TIANHE)
+        53239,  # CSS (WENTIAN)
+        54216,  # CSS (MENGTIAN)
+        37820,  # TIANGONG-1
+        41765,  # TIANGONG-2
+        16609,  # MIR
+        13138,  # SALYUT 7
+        6633,  # SKYLAB
+    }
+)

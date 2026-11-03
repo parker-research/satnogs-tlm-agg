@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 import duckdb
 import polars as pl
 from loguru import logger
 
-from .archive import RawArchive
 from .config import DB_API_BASE
 from .http import SatnogsClient
 from .store import WRITE_LOCK, upsert_df
@@ -54,9 +53,8 @@ def _int(v: Any) -> int | None:
         return None
 
 
-def sync_satellites(client: SatnogsClient, con: duckdb.DuckDBPyConnection, archive: RawArchive) -> int:
+def sync_satellites(client: SatnogsClient, con: duckdb.DuckDBPyConnection) -> int:
     sats = client.get_json(f"{DB_API_BASE}/satellites/", {"format": "json"})
-    archive.write("db_satellites", {"body": sats})
     return ingest_satellites(con, sats)
 
 
@@ -95,9 +93,8 @@ def ingest_satellites(con: duckdb.DuckDBPyConnection, sats: list[dict[str, Any]]
     return df.height
 
 
-def sync_transmitters(client: SatnogsClient, con: duckdb.DuckDBPyConnection, archive: RawArchive) -> int:
+def sync_transmitters(client: SatnogsClient, con: duckdb.DuckDBPyConnection) -> int:
     txs = client.get_json(f"{DB_API_BASE}/transmitters/", {"format": "json"})
-    archive.write("db_transmitters", {"body": txs})
     return ingest_transmitters(con, txs)
 
 
@@ -178,9 +175,9 @@ def insert_frames(con: duckdb.DuckDBPyConnection, df: pl.DataFrame) -> int:
     return n_new
 
 
-def _db_window(lower: datetime | None, upper: datetime) -> dict[str, str]:
+def _db_window(lower: datetime | None, upper: datetime, inclusive: bool) -> dict[str, str]:
     # DB filters: start = timestamp >= x, end = timestamp <= x
-    params = {"end": iso(upper)}
+    params = {"end": iso(upper if inclusive else upper - timedelta(microseconds=1))}
     if lower is not None:
         params["start"] = iso(lower)
     return params
@@ -193,18 +190,17 @@ def ingest_telemetry_page(con: duckdb.DuckDBPyConnection, records: list[dict[str
 def fetch_telemetry(
     client: SatnogsClient,
     con: duckdb.DuckDBPyConnection,
-    archive: RawArchive,
     sat_id: str,
     label: str,
     *,
     max_pages: int,
     schedule: Schedule,
-    decayed: datetime | None = None,
+    launched: datetime | None,
+    decayed: datetime | None,
 ) -> WalkResult:
     return walk(
         client,
         con,
-        archive,
         kind="db_telemetry",
         sat_id=sat_id,
         label=label,
@@ -215,5 +211,6 @@ def fetch_telemetry(
         ingest=lambda records: ingest_telemetry_page(con, records),
         max_pages=max_pages,
         schedule=schedule,
+        launched=launched,
         decayed=decayed,
     )

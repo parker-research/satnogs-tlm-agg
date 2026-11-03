@@ -21,6 +21,8 @@ import duckdb
 import polars as pl
 from loguru import logger
 
+from .config import BLACKLIST_NORAD_IDS
+from .orbit import orbit_states
 from .store import query_pl
 
 # Case-insensitive RE2 patterns (DuckDB). Matches e.g. "batt_temp", "BatteryTemperature",
@@ -70,10 +72,11 @@ def export_metadata(con: duckdb.DuckDBPyConnection, out: Path) -> None:
                date_diff('day', fr.last_frame, s.decayed) AS days_last_frame_before_decay,
                coalesce(obs.n_network_obs, 0) AS n_network_obs,
                coalesce(obs.n_network_obs_good, 0) AS n_network_obs_good,
-               p.backfill_done AS db_backfill_done, p.last_error AS db_last_error
+               c.days_fetched AS db_days_fetched, c.days_remaining AS db_days_remaining,
+               c.last_error AS db_last_error
         FROM satellites s
         LEFT JOIN fr USING (sat_id) LEFT JOIN dec USING (sat_id) LEFT JOIN obs USING (sat_id)
-        LEFT JOIN fetch_progress p ON p.kind = 'db_telemetry' AND p.sat_id = s.sat_id
+        LEFT JOIN fetch_coverage c ON c.kind = 'db_telemetry' AND c.sat_id = s.sat_id
         ORDER BY n_frames DESC
         """,
     )
@@ -197,10 +200,14 @@ def export_temperatures(
                date_diff('second', d.timestamp, s.decayed) / 86400.0 AS days_before_decay,
                d.value BETWEEN -150 AND 250 AS plausible_celsius
         FROM dedup d JOIN satellites s USING (sat_id)
+        WHERE coalesce(d.norad_cat_id, -1) NOT IN (SELECT unnest($blacklist))
         ORDER BY d.sat_id, d.field, d.timestamp
         """,
-        {"inc": temp_regex, "exc": temp_exclude_regex},
+        {"inc": temp_regex, "exc": temp_exclude_regex, "blacklist": sorted(BLACKLIST_NORAD_IDS)},
     )
+    # Orbit state at each reading, propagated with SGP4 from the nearest historical TLE.
+    orbits = orbit_states(con, temps.select("norad_cat_id", "timestamp"))
+    temps = temps.join(orbits, on=["norad_cat_id", "timestamp"], how="left")
     _write(temps, out / "temperatures.parquet")
     logger.info(
         "Exported {} temperature readings ({} satellites, {} fields)",
@@ -228,6 +235,9 @@ def export_temperatures(
             mean=pl.col("value").mean(),
             median=pl.col("value").median(),
             days_before_decay=pl.col("days_before_decay").min(),
+            altitude_km_mean=pl.col("altitude_km").mean(),
+            altitude_km_min=pl.col("altitude_km").min(),
+            speed_km_s_mean=pl.col("speed_km_s").mean(),
         )
         .sort("sat_id", "field", "day")
     )

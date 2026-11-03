@@ -19,6 +19,7 @@ cp .env.sample .env   # then fill in your keys
 
 - `SATNOGS_DB_API_KEY`: required for the DB telemetry endpoint (from your db.satnogs.org profile).
 - `SATNOGS_NETWORK_API_KEY`: optional. Anonymous Network access works but is heavily rate limited.
+- `HF_TOKEN`: optional. Gives higher Hugging Face rate limits when loading historical TLEs.
 
 ## Usage
 
@@ -27,75 +28,95 @@ uv run satnogs-tlm-agg probe --norad 43803   # sanity-check keys + response shap
 uv run satnogs-tlm-agg run                    # long-running mode (leave it on a machine)
 ```
 
-The work is split into two strictly separate stages:
+Everything incremental lives in one DuckDB file, `data/satnogs_tlm_agg.duckdb`: fetched
+frames and observations, fetch progress, TLEs, and decode results. `out/` holds only Parquet
+exports, regenerated from the database.
 
-1. **Fetch** (API requests only). Every response is first appended raw to `data/raw/`, then its
-   frames are stored in DuckDB (`data/satnogs.duckdb`). Nothing is decoded at this stage.
-2. **Process** (no requests). Decodes the stored frames and exports Parquet.
-
-`run` keeps the fetch stage going continuously and runs the process stage every
-`--process-every-hours` (default 12). You can also run each stage on its own:
+`run` fetches continuously. Every `--process-every-hours` (default 12) it loads any missing
+TLEs, decodes the stored frames, and exports Parquet; that step makes no SatNOGS requests.
+Each stage can also be run on its own:
 
 | command    | what it does |
 |------------|--------------|
-| `fetch`    | fetch only, until Ctrl-C (or `--until-idle`) |
+| `fetch`    | SatNOGS fetching only, until Ctrl-C (or `--until-idle`) |
+| `tles`     | load missing historical TLEs from Hugging Face |
 | `decode`   | decode all not-yet-decoded stored frames (local) |
 | `export`   | write Parquet outputs (local) |
-| `status`   | progress: satellites covered/in progress/final, requests made, frames, decodes |
-| `rebuild`  | re-ingest the raw archive into DuckDB, no requests |
+| `status`   | fetched vs. remaining days, requests made, TLEs, decodes |
 | `sync`     | refresh satellite + transmitter catalogues (also automatic every 24 h) |
 | `decoders` | which DB-assigned decoders the installed satnogs-decoders provides |
 
-Narrow the set of satellites with `--norad 39472 61762`, `--status re-entered`,
-`--only-with-decoders`, or `--limit 50`. Fetch channels can be toggled with `--no-db`,
-`--no-network`, `--demod {gap-fill,all,off}`. See `--help` on each command.
+Only one process can open the database at a time (DuckDB lock). Stop `run` before using
+another command, or read the Parquet files in `out/`.
 
-## How fetching works (and why requests are never repeated)
+Narrow the satellites with `--norad 39472 61762`, `--status re-entered`,
+`--only-with-decoders`, or `--limit 50`. Toggle fetch channels with `--no-db`, `--no-network`,
+`--demod {gap-fill,all,off}`. Space stations are always excluded: see
+`BLACKLIST_NORAD_IDS` in `src/satnogs_tlm_agg/config.py`.
 
-API requests are treated as expensive. Server-side limits, from the SatNOGS source code:
+## How fetching works
 
-| channel | page size | server throttle | our default pace | max throughput |
-|---------|-----------|-----------------|------------------|----------------|
-| DB telemetry (`/api/telemetry/`) | 25 frames | 6 req/min per user; **1 req/day per satellite** for "frequency violators" | 1 req / 10.5 s | ~8.5k frames/h, ~200k/day |
-| Network observations | 25 observations | 240 req/h per user (60 anonymous) | 1 req / 15.5 s | ~5.8k observations/h |
-| Network demod files (S3) | 1 frame per file | none | 4 files/s | — |
+SatNOGS API requests are treated as expensive. Server limits, from the SatNOGS source code:
 
-Pages can't be made bigger, since the servers have no page-size parameter. Each satellite's
-history is fetched as **time windows, walked newest → oldest with the server's cursor**:
+| channel | page size | server throttle | our default pace |
+|---------|-----------|-----------------|------------------|
+| DB telemetry | 25 frames | 6 req/min per user; **1 req/day per satellite** for "frequency violators" | 1 req / 10.5 s (~200k frames/day max) |
+| Network observations | 25 observations | 240 req/h per user (60 anonymous) | 1 req / 15.5 s |
+| Network demod files | 1 frame per file | none | 4 files/s |
 
-- **First window = the satellite's whole history** up to `now − 6 h` (the settle time, so
-  late uploads are included). It isn't split into days, because empty days would still cost a
-  request each.
-- **After every page** the raw response is archived, its frames are stored, and the cursor
-  for the next page is saved. Ctrl-C, a crash or a reboot resumes at exactly the next page.
-- **Fairness:** each satellite gets up to `--db-pages-per-turn` (30 pages = 750 frames) per
-  turn, then the next one goes. Priority: re-entered with decoders → with decoders →
-  re-entered → others. Violators are limited to 1 page per day and go last.
-- **Once the history is complete**, later windows only cover `(previous end, now − 6 h]`.
-  There's no overlap, so already-fetched data is never fetched again. Re-checks start
-  after 1 day and double while nothing new arrives, up to 30 days.
-- **Re-entered satellites** become *final* once their coverage reaches 14 days past the decay
-  date. They are never queried again.
-- **Network demod files** are recorded per URL, so an interrupted observation never
-  re-downloads a file. By default (`gap-fill`) they are only downloaded for observations the
-  DB fetch has fully covered without returning frames for them. SatNOGS Network forwards its
-  frames to the DB, so the rest would be duplicates.
+For each satellite (and each source), its mission is fetched in this order:
 
-A first pass over all ~2,800 satellites costs at least ~2,800 DB requests (about 8 hours),
-most of which find little or nothing. Busy satellites then take much longer. For example,
-1M frames = 40k requests ≈ 5 days.
+1. **Probe**: one request over the whole history. Satellites without data are finished
+   after it. Otherwise it returns the newest page.
+2. **End of life**: the 60 days (`--eol-days`) before decay, or before the last record if
+   the satellite is still in orbit, newest first.
+3. **Random chunks** over the rest of the mission, so a representative sample builds up
+   early. Chunks are 1–30 days, sized from the observed record rate to cost about one page.
+4. **Caught up**: new days are fetched once a chunk's worth has accumulated. Re-entered
+   satellites are fetched until 14 days after decay, then never again.
+
+Each chunk is walked newest-first with the server's cursor. After every page the frames are
+stored, the cursor is saved in `fetch_state`, and every completed day is written to
+`fetch_days` with its record count. A restart continues with exactly the next page, and no
+time range is requested twice. Days are only fetched once they ended 6 h ago
+(`--settle-hours`), so late uploads are included.
+
+Progress queries:
+
+```sql
+SELECT * FROM fetch_coverage WHERE kind = 'db_telemetry' ORDER BY days_remaining DESC;
+SELECT * FROM fetch_days WHERE sat_id = '...' ORDER BY day;            -- fetched days
+SELECT * FROM fetch_days_remaining WHERE sat_id = '...' ORDER BY day;  -- remaining days
+```
+
+Network demod files are tracked per URL (`demod_files`). By default (`gap-fill`) they are
+only downloaded for observations on fully fetched DB days that have no DB frames. SatNOGS
+Network forwards its frames to the DB, so the others would be duplicates.
+
+## Orbits
+
+Historical TLEs come from the Hugging Face dataset
+[juliensimon/space-track-tle-history](https://huggingface.co/datasets/juliensimon/space-track-tle-history)
+(one Parquet file per year). The files aren't sorted by NORAD ID, so each yearly file is
+scanned in full once, for every catalogue satellite that can appear in it (2013 onwards).
+`tle_files` records what was loaded, so a file is only re-read when it changes upstream or a
+new satellite appears. The first load reads ~7.8 GB and stores ~10M element sets.
+
+Each temperature reading is propagated with [satkit](https://pypi.org/project/satkit/)
+SGP4 from the TLE nearest in time (at most 7 days away), giving altitude above the WGS-84
+ellipsoid, inertial speed, and the sub-satellite point.
 
 ## Outputs (`out/`)
 
 | file | contents |
 |------|----------|
-| `satellites.parquet`, `transmitters.parquet`, `network_observations.parquet` | catalogues/metadata (observations include `payload_url` → `.ogg`) |
-| `coverage.parquet` | per satellite: frame counts by source, decoded frames, first/last frame, days between last frame and decay |
+| `satellites.parquet`, `transmitters.parquet`, `network_observations.parquet` | catalogues/metadata (observations include `payload_url`: the `.ogg` recording) |
+| `coverage.parquet` | per satellite: frame counts by source, decoded frames, first/last frame, DB days fetched/remaining |
 | `frames/sat_id=<id>/frames.parquet` | every raw frame (hex) from all sources |
 | `decoded/decoder=<d>/<sat_id>.parquet` | wide: one row per decoded frame, one column per decoder field |
 | `fields_long/decoder=<d>.parquet` | long: every numeric decoded field |
-| `temperatures.parquet` | long: temperature-like fields, de-duplicated across receiving stations, with `mission_day`, `days_before_decay`, `n_receptions`, `plausible_celsius` |
-| `temperatures_daily.parquet` | per satellite/field/day: n, min, max, mean, median, days_before_decay |
+| `temperatures.parquet` | long: temperature-like fields, de-duplicated across receiving stations, with `mission_day`, `days_before_decay`, `n_receptions`, `plausible_celsius`, and orbit state (`altitude_km`, `speed_km_s`, `latitude_deg`, `longitude_deg`, `tle_epoch`, `tle_age_days`) |
+| `temperatures_daily.parquet` | per satellite/field/day: n, min, max, mean, median, days_before_decay, mean/min altitude, mean speed |
 
 Example: last 30 days of re-entered satellites.
 
@@ -116,7 +137,7 @@ t.filter(pl.col("status") == "re-entered", pl.col("days_before_decay") < 30)
   still collected for every satellite, so they can be decoded later when decoders appear.
   After a satnogs-decoders upgrade (`uv lock --upgrade-package satnogs-decoders`), failed
   attempts are retried automatically. Use `decode --redecode` to redo successful ones as well.
-- Frames uploaded more than 6 h (`--settle-hours`) after reception, into an already-covered
-  window, are missed. That's the price of never re-reading covered windows.
+- Frames uploaded more than 6 h after their day ended are missed if that day was already
+  fetched.
 - Re-demodulating Network `.ogg` recordings (gr-satnogs) is not implemented yet. The URLs are
   stored in `network_observations.payload_url` for that future step.

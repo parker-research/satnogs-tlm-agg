@@ -1,13 +1,13 @@
 """Command-line interface (tyro subcommands).
 
-Two strictly separated stages:
+Two strictly separated stages, both working on one DuckDB file (`data/satnogs_tlm_agg.duckdb`):
 
-1. **Fetch** (`fetch`, or the fetch half of `run`): API requests only. Every response is
-   archived raw (`data/raw/`) and its frames stored in DuckDB before anything else happens.
-   Three independent channels run concurrently, each paced under its own server throttle:
-   SatNOGS DB telemetry, SatNOGS Network observations, and demod files (S3).
-2. **Process** (`decode`, `export`, or the periodic half of `run`): purely local. Reads stored
-   frames, never makes a request.
+1. **Fetch** (`fetch`, or the fetch half of `run`): SatNOGS API requests only. Frames are stored
+   and progress (`fetch_state`, `fetch_days`) saved after every page. Three channels run
+   concurrently, each paced under its own server throttle: SatNOGS DB telemetry, SatNOGS
+   Network observations, and Network demod files.
+2. **Process** (`tles`, `decode`, `export`, or the periodic half of `run`): loads historical
+   TLEs, decodes the stored frames, propagates orbits, writes Parquet. No SatNOGS requests.
 """
 
 from __future__ import annotations
@@ -26,11 +26,18 @@ from loguru import logger
 
 from . import decode as decode_mod
 from . import export as export_mod
-from . import satnogs_db, satnogs_network, store
-from .archive import RawArchive
-from .config import DB_API_BASE, DB_HOST, NETWORK_API_BASE, NETWORK_HOST, USER_AGENT, Settings, load_settings
+from . import satnogs_db, satnogs_network, store, tles
+from .config import (
+    BLACKLIST_NORAD_IDS,
+    DB_API_BASE,
+    DB_HOST,
+    NETWORK_API_BASE,
+    NETWORK_HOST,
+    USER_AGENT,
+    Settings,
+    load_settings,
+)
 from .http import ApiError, SatnogsClient
-from .rebuild import rebuild as rebuild_from_archive
 from .store import query_pl
 from .timeutil import now
 from .walker import Schedule
@@ -45,7 +52,7 @@ class Common:
     env_file: Path = Path(".env")
     """`.env` file holding SATNOGS_DB_API_KEY / SATNOGS_NETWORK_API_KEY (see `.env.sample`)."""
     data_dir: Path = Path("data")
-    """Working directory: DuckDB database, raw response archive, logs."""
+    """Holds the DuckDB database (`satnogs_tlm_agg.duckdb`)."""
     out_dir: Path = Path("out")
     """Parquet output directory."""
     log_level: str = "INFO"
@@ -53,7 +60,8 @@ class Common:
 
 @dataclass
 class SatFilter:
-    """Which satellites to process. Default: all, prioritised (re-entered with decoders first)."""
+    """Which satellites to process. Default: all except the space-station blacklist,
+    prioritised (re-entered with decoders first)."""
 
     norad: list[int] = field(default_factory=list)
     """Only these NORAD IDs."""
@@ -70,7 +78,7 @@ class SatFilter:
 
 @dataclass
 class FetchOptions:
-    """Request pacing and scheduling. Defaults stay under the SatNOGS server throttles
+    """Request pacing and fetch order. Defaults stay under the SatNOGS server throttles
     (DB telemetry: 6 requests/min per user; Network observations: 240/hour per user)."""
 
     db: bool = True
@@ -78,39 +86,39 @@ class FetchOptions:
     network: bool = True
     """Fetch SatNOGS Network observation metadata (incl. .ogg/demod URLs)."""
     demod: satnogs_network.DemodMode = "gap-fill"
-    """Network demod files: 'gap-fill' = only observations the DB has no frames for
-    (they're otherwise duplicates of DB telemetry); 'all'; or 'off'."""
+    """Network demod files: 'gap-fill' = only observations on fetched DB days without DB
+    frames (they're otherwise duplicates of DB telemetry); 'all'; or 'off'."""
     db_request_interval: float = 10.5
     """Seconds between DB API requests (6/min server throttle)."""
     network_request_interval: float = 15.5
     """Seconds between Network API requests (240/hour server throttle)."""
     media_request_interval: float = 0.25
-    """Seconds between demod file downloads (S3; not API-throttled)."""
+    """Seconds between demod file downloads (not API-throttled)."""
     db_pages_per_turn: int = 30
     """Max DB pages (25 frames each) per satellite before moving to the next one."""
     network_pages_per_turn: int = 10
     """Max Network pages (25 observations each) per satellite per turn."""
     demod_batch: int = 200
     """Observations per demod download batch."""
+    eol_days: int = 60
+    """Days before decay (or before the last record) fetched first."""
+    max_chunk_days: int = 30
+    """Longest random chunk (chunks are sized to ~1 page from the observed record rate)."""
     settle_hours: float = 6.0
-    """Never fetch data newer than this, so late uploads arrive before their window is read."""
-    recheck_min_days: float = 1.0
-    """Re-check a satellite for new data after this long (doubles while nothing new arrives)..."""
-    recheck_max_days: float = 30.0
-    """...up to this long."""
+    """A day is only fetched once it ended this long ago, so late uploads are included."""
     final_after_decay_days: float = 14.0
-    """A re-entered satellite is never re-queried once covered this far past its decay date."""
+    """Re-entered satellites are fetched until this long after decay, then never again."""
     catalogue_refresh_hours: float = 24.0
     """Re-sync the satellite/transmitter catalogues this often."""
 
     def schedule(self, violator: bool = False) -> Schedule:
         return Schedule(
             settle=timedelta(hours=self.settle_hours),
-            base_interval=timedelta(days=self.recheck_min_days),
-            max_interval=timedelta(days=self.recheck_max_days),
             final_after_decay=timedelta(days=self.final_after_decay_days),
+            eol_days=self.eol_days,
+            max_chunk_days=self.max_chunk_days,
             # SatNOGS allows one telemetry request per day for "frequency violator" satellites.
-            min_gap_in_window=timedelta(hours=24.1) if violator else None,
+            min_gap_after_turn=timedelta(hours=24.1) if violator else None,
         )
 
 
@@ -121,22 +129,13 @@ class FetchOptions:
 class Ctx:
     settings: Settings
     con: duckdb.DuckDBPyConnection
-    archive: RawArchive
 
 
 def _setup(common: Common) -> Ctx:
     logger.remove()
     logger.add(sys.stderr, level=common.log_level, enqueue=True)
     settings = load_settings(common.env_file, common.data_dir, common.out_dir)
-    logger.add(
-        settings.data_dir / "logs" / "satnogs-tlm-agg.log",
-        level="DEBUG",
-        rotation="50 MB",
-        retention=20,
-        enqueue=True,
-    )
-    con = store.connect(settings.duckdb_path)
-    return Ctx(settings, con, RawArchive(settings.raw_dir))
+    return Ctx(settings, store.connect(settings.duckdb_path))
 
 
 def _db_client(ctx: Ctx, opts: FetchOptions | None = None) -> SatnogsClient:
@@ -162,33 +161,31 @@ def _network_client(ctx: Ctx, opts: FetchOptions | None = None) -> SatnogsClient
     )
 
 
-def _sync_catalogue_if_stale(
-    ctx: Ctx, con: duckdb.DuckDBPyConnection, client: SatnogsClient, max_age_h: float
-) -> None:
+def _sync_catalogue_if_stale(con: duckdb.DuckDBPyConnection, client: SatnogsClient, max_age_h: float) -> None:
     last = con.execute("SELECT max(synced_at) FROM satellites").fetchall()[0][0]
     if last is None or now() - last > timedelta(hours=max_age_h):
-        satnogs_db.sync_satellites(client, con, ctx.archive)
-        satnogs_db.sync_transmitters(client, con, ctx.archive)
+        satnogs_db.sync_satellites(client, con)
+        satnogs_db.sync_transmitters(client, con)
 
 
 def _due_satellites(con: duckdb.DuckDBPyConnection, kind: str, f: SatFilter) -> pl.DataFrame:
-    """Satellites due for a fetch turn of `kind`, in priority order."""
+    """Satellites with days left to fetch for `kind`, in priority order."""
     df = query_pl(
         con,
         """
-        SELECT s.sat_id, s.norad_cat_id, s.name, s.status, s.decayed,
+        SELECT c.sat_id, c.norad_cat_id, c.name, c.status, c.launched, c.decayed,
                coalesce(s.is_frequency_violator, FALSE) AS violator,
-               EXISTS (SELECT 1 FROM satellite_decoders d WHERE d.sat_id = s.sat_id) AS has_decoder,
-               s.sat_id IN (SELECT sat_id FROM merged_satellites) AS merged,
-               coalesce(p.final, FALSE) AS final,
-               p.next_check_at,
-               p.window_ceiling IS NOT NULL AS in_window
-        FROM satellites s
-        LEFT JOIN fetch_progress p ON p.kind = $kind AND p.sat_id = s.sat_id
+               EXISTS (SELECT 1 FROM satellite_decoders d WHERE d.sat_id = c.sat_id) AS has_decoder,
+               c.sat_id IN (SELECT sat_id FROM merged_satellites) AS merged
+        FROM fetch_coverage c JOIN satellites s USING (sat_id)
+        WHERE c.kind = $kind
+          AND (c.days_remaining > 0 OR c.walking OR NOT c.probed)
+          AND (c.not_before IS NULL OR c.not_before <= now())
+          AND coalesce(c.norad_cat_id, -1) NOT IN (SELECT unnest($blacklist))
         """,
-        {"kind": kind},
+        {"kind": kind, "blacklist": sorted(BLACKLIST_NORAD_IDS)},
     )
-    df = df.filter(pl.col("status").is_in(f.status), ~pl.col("final"))
+    df = df.filter(pl.col("status").is_in(f.status))
     if kind == "db_telemetry":
         # Merged satellites' telemetry is returned when querying their primary.
         df = df.filter(~pl.col("merged"))
@@ -212,18 +209,7 @@ def _due_satellites(con: duckdb.DuckDBPyConnection, kind: str, f: SatFilter) -> 
         descending=[False, False, True, False],
         nulls_last=True,
     )
-    if f.limit is not None:
-        df = df.head(f.limit)
-    return df.filter(pl.col("next_check_at").is_null() | (pl.col("next_check_at") <= now()))
-
-
-def _next_due_in(con: duckdb.DuckDBPyConnection, kind: str) -> float:
-    nxt = con.execute(
-        "SELECT min(next_check_at) FROM fetch_progress WHERE kind = ? AND NOT coalesce(final, FALSE)", [kind]
-    ).fetchall()[0][0]
-    if nxt is None:
-        return 900.0
-    return min(max((nxt - now()).total_seconds(), 60.0), 3600.0)
+    return df.head(f.limit) if f.limit is not None else df
 
 
 def _label(row: dict) -> str:
@@ -232,66 +218,64 @@ def _label(row: dict) -> str:
 
 # --------------------------------------------------------------------------- fetch channels
 
+IDLE_WAIT_S = 900.0
 
-def _db_channel(
-    ctx: Ctx, sats: SatFilter, opts: FetchOptions, stop: threading.Event, until_idle: bool
-) -> None:
+
+def _walk_channel(ctx, sats, opts, stop, until_idle, *, kind, client, fetch_fn, pages, sync=False) -> None:
     con = ctx.con.cursor()
-    client = _db_client(ctx, opts)
     client.stop_event = stop
     while not stop.is_set():
-        _sync_catalogue_if_stale(ctx, con, client, opts.catalogue_refresh_hours)
-        due = _due_satellites(con, "db_telemetry", sats)
-        if due.is_empty():
-            if until_idle:
-                return
-            stop.wait(_next_due_in(con, "db_telemetry"))
-            continue
-        logger.info("DB telemetry: turn over {} due satellites", due.height)
-        before = client.n_requests
+        if sync:
+            _sync_catalogue_if_stale(con, client, opts.catalogue_refresh_hours)
+        due = _due_satellites(con, kind, sats)
+        requests = 0
         for row in due.iter_rows(named=True):
             if stop.is_set():
                 return
-            satnogs_db.fetch_telemetry(
+            res = fetch_fn(
                 client,
                 con,
-                ctx.archive,
                 row["sat_id"],
                 _label(row),
-                max_pages=1 if row["violator"] else opts.db_pages_per_turn,
+                max_pages=1 if row["violator"] else pages,
                 schedule=opts.schedule(violator=row["violator"]),
+                launched=row["launched"],
                 decayed=row["decayed"],
             )
-        logger.info("DB telemetry: turn done ({} requests)", client.n_requests - before)
-
-
-def _network_channel(
-    ctx: Ctx, sats: SatFilter, opts: FetchOptions, stop: threading.Event, until_idle: bool
-) -> None:
-    con = ctx.con.cursor()
-    client = _network_client(ctx, opts)
-    client.stop_event = stop
-    while not stop.is_set():
-        due = _due_satellites(con, "network_obs", sats)
-        if due.is_empty():
+            requests += res.requests
+        if requests == 0:  # everything up to date (or waiting): check again later
             if until_idle:
                 return
-            stop.wait(_next_due_in(con, "network_obs"))
-            continue
-        logger.info("Network observations: turn over {} due satellites", due.height)
-        for row in due.iter_rows(named=True):
-            if stop.is_set():
-                return
-            satnogs_network.fetch_observations(
-                client,
-                con,
-                ctx.archive,
-                row["sat_id"],
-                _label(row),
-                max_pages=opts.network_pages_per_turn,
-                schedule=opts.schedule(),
-                decayed=row["decayed"],
-            )
+            stop.wait(IDLE_WAIT_S)
+
+
+def _db_channel(ctx, sats, opts, stop, until_idle) -> None:
+    _walk_channel(
+        ctx,
+        sats,
+        opts,
+        stop,
+        until_idle,
+        kind="db_telemetry",
+        client=_db_client(ctx, opts),
+        fetch_fn=satnogs_db.fetch_telemetry,
+        pages=opts.db_pages_per_turn,
+        sync=True,
+    )
+
+
+def _network_channel(ctx, sats, opts, stop, until_idle) -> None:
+    _walk_channel(
+        ctx,
+        sats,
+        opts,
+        stop,
+        until_idle,
+        kind="network_obs",
+        client=_network_client(ctx, opts),
+        fetch_fn=satnogs_network.fetch_observations,
+        pages=opts.network_pages_per_turn,
+    )
 
 
 def _demod_channel(
@@ -310,12 +294,12 @@ def _demod_channel(
         ]
     while not stop.is_set():
         n_obs, _ = satnogs_network.fetch_demod_frames(
-            client, con, ctx.archive, mode=opts.demod, sat_ids=sat_ids, limit_observations=opts.demod_batch
+            client, con, mode=opts.demod, sat_ids=sat_ids, limit_observations=opts.demod_batch
         )
         if n_obs == 0:
             if until_idle:
                 return
-            stop.wait(300)
+            stop.wait(IDLE_WAIT_S)
 
 
 def _run_channel(name: str, fn, ctx: Ctx, sats, opts, stop: threading.Event, until_idle: bool) -> None:
@@ -355,6 +339,18 @@ def _start_channels(ctx: Ctx, sats: SatFilter, opts: FetchOptions, stop: threadi
     return threads
 
 
+def _process(con: duckdb.DuckDBPyConnection, out_dir: Path, workers: int) -> None:
+    """TLEs -> decode -> export. No SatNOGS requests."""
+    try:
+        tles.sync_tles(con)
+    except Exception:
+        logger.exception("TLE sync failed; exporting with the TLEs already stored")
+    decode_mod.run_decode(con, workers=workers)
+    export_mod.export_all(con, out_dir)
+    with store.WRITE_LOCK:
+        con.execute("CHECKPOINT")
+
+
 # --------------------------------------------------------------------------- commands
 
 
@@ -362,15 +358,14 @@ def sync(common: Common) -> None:
     """Refresh the satellite and transmitter catalogues from SatNOGS DB."""
     ctx = _setup(common)
     client = _db_client(ctx)
-    satnogs_db.sync_satellites(client, ctx.con, ctx.archive)
-    satnogs_db.sync_transmitters(client, ctx.con, ctx.archive)
+    satnogs_db.sync_satellites(client, ctx.con)
+    satnogs_db.sync_transmitters(client, ctx.con)
 
 
 def fetch(common: Common, sats: SatFilter, opts: FetchOptions, until_idle: bool = False) -> None:
-    """Fetch only (no decoding): store every frame locally. Runs until Ctrl-C, or with
-    --until-idle until no satellite is due any more."""
+    """Fetch only (no processing). Runs until Ctrl-C, or with --until-idle until nothing is due."""
     ctx = _setup(common)
-    _sync_catalogue_if_stale(ctx, ctx.con, _db_client(ctx, opts), opts.catalogue_refresh_hours)
+    _sync_catalogue_if_stale(ctx.con, _db_client(ctx, opts), opts.catalogue_refresh_hours)
     stop = threading.Event()
     threads = _start_channels(ctx, sats, opts, stop, until_idle)
     try:
@@ -383,6 +378,12 @@ def fetch(common: Common, sats: SatFilter, opts: FetchOptions, until_idle: bool 
         for t in threads:
             t.join()
     ctx.con.execute("CHECKPOINT")
+
+
+def tles_cmd(common: Common) -> None:
+    """Load historical TLEs for the catalogue from Hugging Face (incremental)."""
+    ctx = _setup(common)
+    tles.sync_tles(ctx.con)
 
 
 def decode(common: Common, decoder: tuple[str, ...] = (), workers: int = 4, redecode: bool = False) -> None:
@@ -415,10 +416,10 @@ def run(
     process_every_hours: float = 12.0,
     workers: int = 4,
 ) -> None:
-    """Long-running mode: the fetch channels run continuously in the background; every
-    `process_every_hours` the already-stored frames are decoded and exported (no requests)."""
+    """Long-running mode: fetch continuously; every `process_every_hours` load TLEs, decode the
+    stored frames, and export Parquet."""
     ctx = _setup(common)
-    _sync_catalogue_if_stale(ctx, ctx.con, _db_client(ctx, opts), opts.catalogue_refresh_hours)
+    _sync_catalogue_if_stale(ctx.con, _db_client(ctx, opts), opts.catalogue_refresh_hours)
     stop = threading.Event()
     threads = _start_channels(ctx, sats, opts, stop, until_idle=False)
     proc_con = ctx.con.cursor()
@@ -426,12 +427,9 @@ def run(
         while not stop.is_set():
             if stop.wait(process_every_hours * 3600):
                 break
-            logger.info("Processing stored frames (decode + export)")
+            logger.info("Processing stored data (TLEs, decode, export)")
             try:
-                decode_mod.run_decode(proc_con, workers=workers)
-                export_mod.export_all(proc_con, ctx.settings.out_dir)
-                with store.WRITE_LOCK:
-                    proc_con.execute("CHECKPOINT")
+                _process(proc_con, ctx.settings.out_dir, workers)
             except Exception:
                 logger.exception("Processing failed; fetching continues")
     except KeyboardInterrupt:
@@ -442,14 +440,8 @@ def run(
     ctx.con.execute("CHECKPOINT")
 
 
-def rebuild(common: Common) -> None:
-    """Re-ingest all archived raw API responses into DuckDB (no requests)."""
-    ctx = _setup(common)
-    rebuild_from_archive(ctx.con, ctx.archive)
-
-
 def status(common: Common, top: int = 30) -> None:
-    """Summary of what has been collected and what is still to fetch."""
+    """What has been fetched, and what remains."""
     ctx = _setup(common)
     con = ctx.con
     pl.Config.set_tbl_rows(top)
@@ -464,15 +456,16 @@ def status(common: Common, top: int = 30) -> None:
         query_pl(
             con,
             """
-            SELECT kind, count(*) AS sats,
-                   count(*) FILTER (WHERE covered_until IS NOT NULL) AS history_done,
-                   count(*) FILTER (WHERE window_ceiling IS NOT NULL) AS walking,
-                   count(*) FILTER (WHERE final) AS final,
-                   count(*) FILTER (WHERE next_check_at > now()) AS waiting,
+            SELECT kind, count(*) FILTER (WHERE probed) AS sats_probed,
+                   count(*) FILTER (WHERE probed AND days_remaining = 0) AS sats_complete,
+                   sum(days_fetched)::BIGINT AS days_fetched, sum(days_remaining)::BIGINT AS days_remaining,
                    sum(n_records)::BIGINT AS records, sum(n_requests)::BIGINT AS requests,
                    count(*) FILTER (WHERE last_error IS NOT NULL) AS with_errors
-            FROM fetch_progress GROUP BY 1 ORDER BY 1
+            FROM fetch_coverage WHERE coalesce(norad_cat_id, -1) NOT IN (SELECT unnest($bl))
+              AND status IN ('in orbit', 're-entered')
+            GROUP BY 1 ORDER BY 1
             """,
+            {"bl": sorted(BLACKLIST_NORAD_IDS)},
         )
     )
     print(
@@ -482,6 +475,7 @@ def status(common: Common, top: int = 30) -> None:
                       count(*) FILTER (WHERE demod_fetched) AS demod_fetched FROM network_observations""",
         )
     )
+    print(query_pl(con, "SELECT count(DISTINCT norad_cat_id) AS tle_sats, count(*) AS tles FROM tles"))
     print(
         query_pl(
             con,
@@ -492,10 +486,9 @@ def status(common: Common, top: int = 30) -> None:
     print(
         query_pl(
             con,
-            """SELECT s.name, s.norad_cat_id, s.status, p.n_records, p.n_requests,
-                      p.covered_until IS NOT NULL AS history_done, p.oldest_ts, p.newest_ts, p.next_check_at
-               FROM fetch_progress p JOIN satellites s USING (sat_id)
-               WHERE p.kind = 'db_telemetry' ORDER BY p.n_records DESC""",
+            """SELECT name, norad_cat_id, status, n_records, n_requests, days_fetched, days_remaining,
+                      first_day, last_day
+               FROM fetch_coverage WHERE kind = 'db_telemetry' ORDER BY n_records DESC""",
         ).head(top)
     )
 
@@ -503,20 +496,18 @@ def status(common: Common, top: int = 30) -> None:
 def probe(common: Common, norad: int = 43803) -> None:
     """Fetch one page from each telemetry/observation endpoint and print it (2 requests)."""
     ctx = _setup(common)
-    _sync_catalogue_if_stale(ctx, ctx.con, _db_client(ctx), 24 * 365)
+    _sync_catalogue_if_stale(ctx.con, _db_client(ctx), 24 * 365)
     rows = ctx.con.execute("SELECT sat_id, name FROM satellites WHERE norad_cat_id = ?", [norad]).fetchall()
     if not rows:
         raise SystemExit(f"NORAD {norad} not in the satellite catalogue")
     sat_id, name = rows[0]
     print(f"{name}: sat_id={sat_id}")
     page = _db_client(ctx).get_page(f"{DB_API_BASE}/telemetry/", {"sat_id": sat_id, "format": "json"})
-    ctx.archive.write("probe", {"sat_id": sat_id, "url": page.url, "body": page.body})
     print(f"DB telemetry: {len(page.records)} records, next={page.next_url}")
     print("first record:", page.records[0] if page.records else None)
     page = _network_client(ctx).get_page(
         f"{NETWORK_API_BASE}/observations/", {"sat_id": sat_id, "format": "json"}
     )
-    ctx.archive.write("probe", {"sat_id": sat_id, "url": page.url, "body": page.body})
     print(f"Network: {len(page.records)} observations, next={page.next_url}")
 
 
@@ -537,13 +528,13 @@ def main() -> None:
             {
                 "run": run,
                 "fetch": fetch,
+                "tles": tles_cmd,
                 "decode": decode,
                 "export": export,
                 "status": status,
                 "sync": sync,
                 "probe": probe,
                 "decoders": decoders,
-                "rebuild": rebuild,
             },
             description="Aggregate SatNOGS telemetry for as many satellites as possible.",
             config=(tyro.conf.OmitArgPrefixes,),
