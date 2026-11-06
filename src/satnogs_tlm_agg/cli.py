@@ -135,6 +135,7 @@ def _setup(common: Common) -> Ctx:
     logger.remove()
     logger.add(sys.stderr, level=common.log_level, enqueue=True)
     settings = load_settings(common.env_file, common.data_dir, common.out_dir)
+    logger.info("Starting (database: {})", settings.duckdb_path)
     return Ctx(settings, store.connect(settings.duckdb_path))
 
 
