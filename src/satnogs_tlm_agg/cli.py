@@ -309,6 +309,11 @@ def _run_channel(name: str, fn, ctx: Ctx, sats, opts, stop: threading.Event, unt
             return
         except KeyboardInterrupt:
             return
+        except duckdb.FatalException:
+            # The database is invalidated; every further query fails until the process restarts.
+            logger.exception("{}: fatal DuckDB error; stopping all channels", name)
+            stop.set()
+            return
         except ApiError as exc:
             if exc.status in (401, 403):
                 logger.error("{}: authentication failed - check API keys in .env: {}", name, exc)
@@ -337,6 +342,14 @@ def _start_channels(ctx: Ctx, sats: SatFilter, opts: FetchOptions, stop: threadi
     for t in threads:
         t.start()
     return threads
+
+
+def _final_checkpoint(con: duckdb.DuckDBPyConnection) -> None:
+    try:
+        con.execute("CHECKPOINT")
+    except duckdb.FatalException:
+        logger.error("Database was invalidated by an earlier fatal error; restart to recover from the WAL")
+        raise SystemExit(1) from None
 
 
 def _process(con: duckdb.DuckDBPyConnection, out_dir: Path, workers: int) -> None:
@@ -377,7 +390,7 @@ def fetch(common: Common, sats: SatFilter, opts: FetchOptions, until_idle: bool 
         stop.set()
         for t in threads:
             t.join()
-    ctx.con.execute("CHECKPOINT")
+    _final_checkpoint(ctx.con)
 
 
 def tles_cmd(common: Common) -> None:
@@ -430,6 +443,9 @@ def run(
             logger.info("Processing stored data (TLEs, decode, export)")
             try:
                 _process(proc_con, ctx.settings.out_dir, workers)
+            except duckdb.FatalException:
+                logger.exception("Processing hit a fatal DuckDB error; stopping")
+                break
             except Exception:
                 logger.exception("Processing failed; fetching continues")
     except KeyboardInterrupt:
@@ -437,7 +453,7 @@ def run(
     stop.set()
     for t in threads:
         t.join()
-    ctx.con.execute("CHECKPOINT")
+    _final_checkpoint(ctx.con)
 
 
 def status(common: Common, top: int = 30) -> None:

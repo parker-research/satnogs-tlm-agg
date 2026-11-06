@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 from pathlib import Path
 from typing import Literal
@@ -235,8 +236,23 @@ WRITE_LOCK = threading.RLock()
 
 
 def connect(path: Path, read_only: bool = False) -> duckdb.DuckDBPyConnection:
+    """Open the store. Memory settings keep a long `run` from exhausting DuckDB's buffer pool:
+    once a checkpoint can't allocate, DuckDB invalidates the database until restart.
+
+    `SATNOGS_TLM_AGG_MEMORY_LIMIT` (e.g. '4GB') and `SATNOGS_TLM_AGG_THREADS` override the
+    defaults (DuckDB's 80% of RAM, 4 threads)."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    con = duckdb.connect(str(path), read_only=read_only)
+    config: dict[str, str] = {
+        "threads": os.environ.get("SATNOGS_TLM_AGG_THREADS", "").strip() or "4",
+        # Large sorts/joins spill to disk instead of failing.
+        "temp_directory": str(path.parent / ".duckdb_tmp"),
+        "preserve_insertion_order": "false",
+    }
+    if limit := os.environ.get("SATNOGS_TLM_AGG_MEMORY_LIMIT", "").strip():
+        config["memory_limit"] = limit
+    con = duckdb.connect(str(path), read_only=read_only, config=config)
+    # The TLE sync streams ~12 GB of remote Parquet; don't keep it in the buffer pool.
+    con.execute("SET enable_external_file_cache = false")
     con.execute("SET GLOBAL TimeZone = 'UTC'")
     if not read_only:
         con.execute(SCHEMA)
